@@ -1,9 +1,11 @@
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
+use std::hash::{Hash, Hasher};
 use std::process::Command;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use clap::{Arg, App};
 use job_scheduler::{JobScheduler, Job};
 use shiplift::Docker;
@@ -21,10 +23,66 @@ impl Image {
     fn new(name : &str, id : &str) -> Image {
         Image {
             name: name.to_string(),
-            // Remove the "sha256:" from the front of the id
+            // Remove the "sha256:" from the front of the digest
             id: id.split(':').nth(1).unwrap().to_string(),
         }
     }
+}
+
+impl PartialEq for Image {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+impl Eq for Image {}
+
+impl Hash for Image {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+#[async_trait]
+trait ImageProvider {
+    async fn get_image_list(&self) -> Option<HashSet<Image>>;
+}
+
+#[async_trait]
+impl ImageProvider for Docker {
+    async fn get_image_list(&self) -> Option<HashSet<Image>> {
+        let result = self.containers().list(&Default::default()).await;
+        match result {
+            Ok(container) => {
+                let images = container.into_iter().map(|c| {
+                        Image::new(&c.image, &c.image_id)
+                    }).collect();
+
+                Some(images)
+            }
+
+            Err(e) => {
+                eprintln!("Error fetching images: {}", e);
+                None
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl ImageProvider for Vec<Docker> {
+
+    async fn get_image_list(&self) -> Option<HashSet<Image>> {
+        let mut images = HashSet::new();
+        for server in self {
+            let newones = server.get_image_list().await;
+            if let Some(new_images) = newones {
+                images.extend(new_images.into_iter());
+            }
+        }
+
+        Some(images)
+    }
+
 }
 
 
@@ -53,22 +111,15 @@ fn run_trivy(image : &Image) -> bool {
 }
 
 
-async fn check_images(docker : &Docker) -> Vec<Image> {
+async fn check_images(image_provider : &impl ImageProvider) -> Vec<Image> {
     let mut vulnerable = Vec::new();
 
-    let result = docker.containers().list(&Default::default()).await;
-    match result {
-        Ok(container) => {
-            for c in container {
-                let image = Image::new(&c.image, &c.image_id);
-
-                println!("Checking {}\n", image.name);
-                if !run_trivy(&image) {
-                    vulnerable.push(image);
-                }
-            }
+    let images = image_provider.get_image_list().await.unwrap();
+    for image in images {
+        println!("Checking {}\n", image.name);
+        if !run_trivy(&image) {
+            vulnerable.push(image);
         }
-        Err(e) => eprintln!("Error: {}", e),
     }
 
     return vulnerable;
@@ -94,8 +145,8 @@ fn send_notification(image : &Image, notify_url : &str, notify_template : &str) 
 }
 
 
-async fn run_checker(docker : &Docker, notify_url : &str, notify_template : &str) {
-    let vulnerable = check_images(&docker).await;
+async fn run_checker(image_provider : &impl ImageProvider, notify_url : &str, notify_template : &str) {
+    let vulnerable = check_images(image_provider).await;
 
     if vulnerable.len() == 0 {
         println!("No vulnerabilities found");
@@ -116,35 +167,54 @@ fn main() {
             .short("s")
             .long("schedule")
             .takes_value(true)
+            .max_values(1)
             .help("When to run trivy in cron format"))
         .arg(Arg::with_name("url")
             .required(true)
             .short("u")
             .long("notify-url")
             .takes_value(true)
+            .max_values(1)
             .help("shoutrrr url to send messages to"))
         .arg(Arg::with_name("template")
             .short("t")
             .long("notify-template")
             .takes_value(true)
+            .max_values(1)
             .help("Message to send when vulnerabilities are found. \
                   '{name}' and '{id}' are replaced with details of \
                   the vulnerable image")
             .default_value(DEFAULT_NOTIFY_TEMPLATE))
+        .arg(Arg::with_name("hosts")
+            .short("H")
+            .long("hosts")
+            .required(true)
+            .takes_value(true)
+            .min_values(1)
+            .help("Docker hosts to connect to"))
         .get_matches();
 
     let schedule = matches.value_of("schedule").unwrap();
     let notify_url = matches.value_of("url").unwrap();
     let notify_template = matches.value_of("template").unwrap();
+    let hosts = matches.values_of("hosts").unwrap();
+
+    let mut servers = Vec::new();
+    for host in hosts {
+        if let Some(path) = host.strip_prefix("unix://") {
+            servers.push(Docker::unix(path));
+        } else {
+            servers.push(Docker::host(host.parse().expect("Invalid host URL")));
+        }
+    }
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let docker = Docker::new();
 
     let mut sched = JobScheduler::new();
     sched.add(Job::new(schedule.parse().unwrap(), || {
         rt.block_on(async {
             println!("Running trivy\n");
-            run_checker(&docker, notify_url, notify_template).await;
+            run_checker(&servers, notify_url, notify_template).await;
         });
     }));
 
