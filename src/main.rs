@@ -3,11 +3,13 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::hash::{Hash, Hasher};
 use std::process::Command;
+use std::str::FromStr;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use clap::{Arg, App};
-use job_scheduler::{JobScheduler, Job};
+use chrono::Utc;
+use job_scheduler::{JobScheduler, Job, Schedule};
 use shiplift::Docker;
 
 
@@ -209,17 +211,21 @@ fn main() {
     }
 
     let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut scheduler = JobScheduler::new();
 
-    let mut sched = JobScheduler::new();
-    sched.add(Job::new(schedule.parse().unwrap(), || {
+    let schedule = Schedule::from_str(schedule).unwrap();
+    println!("Next run scheduled for {}", schedule.upcoming(Utc).next().unwrap());
+
+    scheduler.add(Job::new(schedule.clone(), move || {
         rt.block_on(async {
             println!("Running trivy\n");
             run_checker(&servers, notify_url, notify_template).await;
+            println!("Next run scheduled for {}", schedule.upcoming(Utc).next().unwrap());
         });
     }));
 
     loop {
-        sched.tick();
+        scheduler.tick();
         std::thread::sleep(Duration::from_secs(1));
     }
 }
