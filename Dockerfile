@@ -12,9 +12,13 @@ WORKDIR ./trivy-scheduler
 COPY Cargo.toml Cargo.lock ./
 RUN cargo build --release
 
+RUN rm src/*.rs
+
 
 # Build the real application
-COPY src ./src
+COPY --chown=rust:rust . ./
+RUN rm ./target/x86_64-unknown-linux-musl/release/deps/trivy_scheduler*
+
 RUN cargo build --release
 
 
