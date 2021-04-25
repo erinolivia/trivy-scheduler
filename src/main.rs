@@ -97,7 +97,7 @@ fn run_trivy(image : &Image) -> bool {
         ).collect();
 
     trivy.env_clear();
-    trivy.env("TRIVY_TEMPLATE", "@templates/html.tpl");
+    trivy.env("TRIVY_TEMPLATE", "/templates/html.tpl");
     trivy.envs(&trivy_env);
 
     trivy.arg("image");
